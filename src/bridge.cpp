@@ -5,9 +5,12 @@
 #include <winsock2.h>
 #include <windows.h>
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #include "lk2_mailbox.h"
+#include "lk2_meter.h"
 #include "lk2_proto.h"
 #include "log.h"
 
@@ -51,17 +54,62 @@ struct State {
     uint32_t sent = 0, received = 0, dropped = 0, lost = 0;
     bool connectFailLogged = false;
     bool queueFullLogged = false;
+    // Game-thread meters (Stage 3, E4 as a number). Post/Poll run on the game
+    // thread only; Remove() reads them after the worker has stopped.
+    uint64_t qpcFreq = 0;
+    lk2::MaxTimer postTimer;
+    lk2::MaxTimer pollTimer;
+    lk2::PollTraceThinner thinner;
 };
 
 Mailbox g_box;  // ~260 KB of static storage; never on a stack
 State g_st;
+
+// Every bridge line carries "t=<ms since the DLL loaded>" so post -> stored
+// latency can be read DLL-side; the responder log has the wall clock and the
+// two are aligned on the "connected" line.
+void BLog(const char* fmt, ...) {
+    char body[900];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf(body, sizeof(body), fmt, args);
+    va_end(args);
+    body[sizeof(body) - 1] = '\0';
+    log::Writef("bridge: t=%u %s", log::MillisSinceInit(), body);
+}
+
+void BTrace(const char* fmt, ...) {
+    if (!log::DiagnosticEnabled()) return;
+    char body[900];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf(body, sizeof(body), fmt, args);
+    va_end(args);
+    body[sizeof(body) - 1] = '\0';
+    log::Trace("bridge: t=%u %s", log::MillisSinceInit(), body);
+}
+
+uint64_t Now() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart);
+}
+
+// Records the time from construction to scope exit into a MaxTimer: one of
+// these at the top of Post/Poll covers every return path, log write included.
+struct ScopedMax {
+    lk2::MaxTimer& timer;
+    uint64_t t0;
+    explicit ScopedMax(lk2::MaxTimer& t) : timer(t), t0(Now()) {}
+    ~ScopedMax() { timer.Record(t0, Now()); }
+};
 
 int WsaError() { return g_st.ws.lastError ? g_st.ws.lastError() : -1; }
 
 template <typename Fn>
 bool Resolve(Fn* out, const char* name) {
     *out = reinterpret_cast<Fn>(GetProcAddress(g_st.ws.lib, name));
-    if (!*out) log::Writef("bridge: ws2_32!%s not found", name);
+    if (!*out) BLog("ws2_32!%s not found", name);
     return *out != nullptr;
 }
 
@@ -69,7 +117,7 @@ bool LoadWinsock() {
     Ws& w = g_st.ws;
     w.lib = LoadLibraryA("ws2_32.dll");
     if (!w.lib) {
-        log::Writef("bridge: LoadLibrary(ws2_32.dll) failed (error %u)", GetLastError());
+        BLog("LoadLibrary(ws2_32.dll) failed (error %u)", GetLastError());
         return false;
     }
     const bool ok = Resolve(&w.startup, "WSAStartup") && Resolve(&w.cleanup, "WSACleanup") &&
@@ -82,7 +130,7 @@ bool LoadWinsock() {
     WSADATA data;
     const int rc = w.startup(MAKEWORD(2, 2), &data);
     if (rc != 0) {
-        log::Writef("bridge: WSAStartup failed (%d)", rc);
+        BLog("WSAStartup failed (%d)", rc);
         return false;
     }
     g_st.wsaReady = true;
@@ -91,18 +139,19 @@ bool LoadWinsock() {
 
 void Disconnect(const char* why) {
     if (g_st.sock == INVALID_SOCKET) return;
+    const int err = WsaError();  // before shutdown/closesocket overwrite it
     g_st.ws.shutdown(g_st.sock, SD_BOTH);
     g_st.ws.closesocket(g_st.sock);
     g_st.sock = INVALID_SOCKET;
     InterlockedExchange(&g_st.connected, 0);
-    log::Writef("bridge: disconnected (%s, WSA %d); reconnecting", why, WsaError());
+    BLog("disconnected (%s, WSA %d); reconnecting", why, err);
 }
 
 bool Connect() {
     Ws& w = g_st.ws;
     SOCKET s = w.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
-        if (!g_st.connectFailLogged) log::Writef("bridge: socket() failed (WSA %d)", WsaError());
+        if (!g_st.connectFailLogged) BLog("socket() failed (WSA %d)", WsaError());
         g_st.connectFailLogged = true;
         return false;
     }
@@ -116,7 +165,7 @@ bool Connect() {
         const int err = WsaError();
         w.closesocket(s);
         if (!g_st.connectFailLogged)
-            log::Writef("bridge: connect to 127.0.0.1:%d failed (WSA %d); retrying every 1 s, "
+            BLog("connect to 127.0.0.1:%d failed (WSA %d); retrying every 1 s, "
                         "silently until it changes", kPort, err);
         g_st.connectFailLogged = true;
         return false;
@@ -126,7 +175,7 @@ bool Connect() {
     g_st.sock = s;
     g_st.connectFailLogged = false;
     InterlockedExchange(&g_st.connected, 1);
-    log::Writef("bridge: connected to 127.0.0.1:%d", kPort);
+    BLog("connected to 127.0.0.1:%d", kPort);
     return true;
 }
 
@@ -146,11 +195,12 @@ void HandleLine(const char* line, size_t len) {
     uint32_t n = 0;
     bool cut = false;
     if (!lk2::DecodeLine(line, len, &id, text, sizeof(text), &n, &cut)) {
-        log::Writef("bridge: undecodable line (%u bytes) \"%.60s\"", static_cast<unsigned>(len), line);
+        BLog("undecodable line (%u bytes) \"%.*s\"", static_cast<unsigned>(len),
+             static_cast<int>(len < 60 ? len : 60), line);
         ++g_st.dropped;
         return;
     }
-    if (cut) log::Writef("bridge: reply id=%d cut to %u bytes", id, n);
+    if (cut) BLog("reply id=%d cut to %u bytes", id, n);
 
     EnterCriticalSection(&g_st.lock);
     const int latest = g_box.LastPostedId();
@@ -161,31 +211,31 @@ void HandleLine(const char* line, size_t len) {
     switch (d) {
         case Mailbox::Deliver::kStored:
             ++g_st.received;
-            log::Writef("bridge: reply id=%d len=%u stored \"%.80s\"", id, n, text);
+            BLog("reply id=%d len=%u stored \"%.80s\"", id, n, text);
             break;
         case Mailbox::Deliver::kLate:
             ++g_st.dropped;
-            log::Writef("bridge: LATE reply id=%d dropped (latest post is %d) \"%.80s\"", id,
+            BLog("LATE reply id=%d dropped (latest post is %d) \"%.80s\"", id,
                         latest, text);
             break;
         case Mailbox::Deliver::kUnknown:
             ++g_st.dropped;
-            log::Writef("bridge: reply id=%d dropped: no such request (latest post is %d)", id,
+            BLog("reply id=%d dropped: no such request (latest post is %d)", id,
                         latest);
             break;
         case Mailbox::Deliver::kFull:
             ++g_st.dropped;
-            log::Writef("bridge: reply id=%d dropped: inbound table full", id);
+            BLog("reply id=%d dropped: inbound table full", id);
             break;
     }
 }
 
 DWORD WINAPI Worker(LPVOID) {
     if (!LoadWinsock()) {
-        log::Write("bridge: worker exiting; LK2_Poll will always return \"\"");
+        BLog("worker exiting; LK2_Poll will always return \"\"");
         return 0;
     }
-    log::Writef("bridge: worker running; target 127.0.0.1:%d", kPort);
+    BLog("worker running; target 127.0.0.1:%d", kPort);
 
     static char rx[2 * lk2::kMaxText + 64];
     size_t rxLen = 0;
@@ -209,19 +259,19 @@ DWORD WINAPI Worker(LPVOID) {
             if (!have) break;
             const size_t n = lk2::EncodeLine(msg.id, msg.text, msg.len, line, sizeof(line));
             if (n == 0) {
-                log::Writef("bridge: request id=%d could not be encoded (%u bytes); lost", msg.id,
+                BLog("request id=%d could not be encoded (%u bytes); lost", msg.id,
                             msg.len);
                 ++g_st.lost;
                 continue;
             }
             if (!SendAll(line, n)) {
-                log::Writef("bridge: request id=%d lost in send", msg.id);
+                BLog("request id=%d lost in send", msg.id);
                 ++g_st.lost;
                 Disconnect("send failed");
                 break;
             }
             ++g_st.sent;
-            log::Writef("bridge: sent id=%d len=%u \"%.80s\"", msg.id, msg.len, msg.text);
+            BLog("sent id=%d len=%u \"%.80s\"", msg.id, msg.len, msg.text);
         }
         if (g_st.sock == INVALID_SOCKET) continue;
 
@@ -261,7 +311,7 @@ DWORD WINAPI Worker(LPVOID) {
             rxLen -= start;
         }
         if (rxLen == sizeof(rx)) {
-            log::Writef("bridge: inbound line longer than %u bytes; discarded",
+            BLog("inbound line longer than %u bytes; discarded",
                         static_cast<unsigned>(sizeof(rx)));
             rxLen = 0;
         }
@@ -276,15 +326,19 @@ DWORD WINAPI Worker(LPVOID) {
 void EnsureStarted() {
     if (g_st.started) return;
     g_st.started = true;
+    const uint64_t t0 = Now();
+    LARGE_INTEGER f;
+    g_st.qpcFreq = QueryPerformanceFrequency(&f) ? static_cast<uint64_t>(f.QuadPart) : 0;
     InitializeCriticalSection(&g_st.lock);
     g_st.lockReady = true;
     g_st.stop = 0;
     g_st.thread = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     if (!g_st.thread) {
-        log::Writef("bridge: worker thread could not start (error %u)", GetLastError());
+        BLog("worker thread could not start (error %u)", GetLastError());
         return;
     }
-    log::Writef("bridge: worker started on first use (port %d)", kPort);
+    BLog("worker started on first use (port %d) in %u us", kPort,
+         lk2::TicksToMicros(Now() - t0, g_st.qpcFreq));
 }
 
 }  // namespace
@@ -292,19 +346,25 @@ void EnsureStarted() {
 int Post(const char* text, uint32_t len) {
     EnsureStarted();
     if (!g_st.lockReady) return 0;
+    ScopedMax meter(g_st.postTimer);
+    bool cut = false;
     EnterCriticalSection(&g_st.lock);
-    const int id = g_box.Post(text, len);
+    const int id = g_box.Post(text, len, &cut);
     const int queued = g_box.OutboundCount();
     LeaveCriticalSection(&g_st.lock);
     if (id == 0) {
         if (!g_st.queueFullLogged)
-            log::Writef("bridge: outbound queue full (%d queued; responder absent?) -> "
+            BLog("outbound queue full (%d queued; responder absent?) -> "
                         "LK2_Post returns 0 until it drains", queued);
         g_st.queueFullLogged = true;
         return 0;
     }
     g_st.queueFullLogged = false;
-    log::Writef("bridge: post id=%d len=%u \"%.80s\" (queued %d, %s)", id, len, text, queued,
+    if (cut) {
+        BLog("post id=%d cut from %u to %u bytes (kMaxText)", id, len, lk2::kMaxText - 1);
+        len = lk2::kMaxText - 1;  // the length that was queued and will be sent
+    }
+    BLog("post id=%d len=%u \"%.80s\" (queued %d, %s)", id, len, text, queued,
                 InterlockedCompareExchange(&g_st.connected, 0, 0) ? "connected" : "not connected");
     return id;
 }
@@ -312,14 +372,24 @@ int Post(const char* text, uint32_t len) {
 bool Poll(int id, char* out, uint32_t cap, uint32_t* len) {
     EnsureStarted();
     if (!g_st.lockReady) return false;
+    ScopedMax meter(g_st.pollTimer);
     EnterCriticalSection(&g_st.lock);
     const bool ok = g_box.Poll(id, out, cap, len);
     const int latest = g_box.LastPostedId();
     LeaveCriticalSection(&g_st.lock);
     if (ok) {
-        log::Writef("bridge: poll id=%d (latest %d) -> len=%u \"%.80s\"", id, latest, *len, out);
+        BLog("poll id=%d (latest %d) -> len=%u \"%.80s\"", id, latest, *len, out);
     } else {
-        log::Trace("bridge: poll id=%d (latest %d) -> nothing", id, latest);
+        // One trace per (id, latest) state; run 1 wrote 100 identical lines
+        // between "End." and quit.
+        uint32_t swallowed = 0;
+        if (g_st.thinner.Note(id, latest, &swallowed)) {
+            if (swallowed)
+                BTrace("poll id=%d (latest %d) -> nothing [%u earlier identical polls untraced]",
+                       id, latest, swallowed);
+            else
+                BTrace("poll id=%d (latest %d) -> nothing", id, latest);
+        }
     }
     return ok;
 }
@@ -329,9 +399,11 @@ void Remove() {
     InterlockedExchange(&g_st.stop, 1);
     bool workerGone = true;
     if (g_st.thread) {
-        // At process exit the worker is already dead (log.h explains the order),
-        // so this returns at once; under an explicit unload it ends within one
-        // retry sleep. Either way the wait is bounded.
+        // The worker reads `stop` only at the top of its loop, so an explicit
+        // unload waits for whatever it is inside: a 50 ms select when connected,
+        // up to the 1 s retry sleep when not, or a connect() that loopback
+        // answers at once. 1500 ms covers all three. At process exit the thread
+        // is already gone (log.h explains the order) and this returns at once.
         workerGone = WaitForSingleObject(g_st.thread, 1500) == WAIT_OBJECT_0;
         CloseHandle(g_st.thread);
         g_st.thread = nullptr;
@@ -340,9 +412,16 @@ void Remove() {
         DeleteCriticalSection(&g_st.lock);
         g_st.lockReady = false;
     }
-    log::Writef("bridge: removed; sent %u, received %u, dropped %u, lost %u%s", g_st.sent,
-                g_st.received, g_st.dropped, g_st.lost,
-                workerGone ? "" : " (worker did not stop in time)");
+    BLog("removed; sent %u, received %u, dropped %u, lost %u%s", g_st.sent, g_st.received,
+         g_st.dropped, g_st.lost, workerGone ? "" : " (worker did not stop in time)");
+    // Exit criterion E4 as a number: the longest the game thread ever spent in
+    // either routine, log write included.
+    BLog("game-thread max post=%u us poll=%u us over %u posts, %u polls",
+         lk2::TicksToMicros(g_st.postTimer.maxTicks, g_st.qpcFreq),
+         lk2::TicksToMicros(g_st.pollTimer.maxTicks, g_st.qpcFreq), g_st.postTimer.count,
+         g_st.pollTimer.count);
+    const uint32_t untraced = g_st.thinner.Flush();
+    if (untraced) BTrace("%u trailing identical empty polls untraced", untraced);
     g_st.started = false;
 }
 

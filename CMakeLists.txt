@@ -58,6 +58,7 @@ add_library(k2se SHARED
     src/npcvariety.cpp
     src/lk2_proto.cpp
     src/lk2_mailbox.cpp
+    src/lk2_meter.cpp
     src/bridge.cpp
     "${GENERATED_PROXY}"
 )

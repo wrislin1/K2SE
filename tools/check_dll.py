@@ -4,7 +4,8 @@ Checks:
   1. 32-bit PE (the game is a 32-bit process; a 64-bit DLL can never load)
   2. it is a DLL
   3. its export names match the real SysWOW64\\version.dll exactly
-  4. its imports (goal: KERNEL32 only, so no VC++ redistributable is needed)
+  4. its imports: KERNEL32 only (no VC++ redistributable, no Winsock under
+     the loader lock); anything else is a FAILURE, not a warning
 
 Usage:
     python tools/check_dll.py [path-to-built-version.dll]
@@ -64,6 +65,14 @@ def parse(path):
     return {"machine": machine, "chars": chars, "imports": imports, "sections": sections}
 
 
+def imports_verdict(imports):
+    """(ok, label) for the import table: only KERNEL32 passes. A foreign import
+    means a VC++ redistributable or a Winsock load under the loader lock, so it
+    FAILS the build rather than warning (Stage 2 review, 2026-10-09)."""
+    ok = [i.upper() for i in imports] == ["KERNEL32.DLL"]
+    return ok, ("OK" if ok else "FAIL")
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
     if not os.path.exists(path):
@@ -99,10 +108,10 @@ def main():
         if extra:
             print("       EXTRA  : %s" % ", ".join(extra))
 
-    imports = [i.upper() for i in info["imports"]]
-    only_kernel = imports == ["KERNEL32.DLL"]
+    only_kernel, label = imports_verdict(info["imports"])
     print("%-4s imports only KERNEL32 -> %s"
-          % ("OK" if only_kernel else "WARN", ", ".join(info["imports"]) or "(none)"))
+          % (label, ", ".join(info["imports"]) or "(none)"))
+    failures += 0 if only_kernel else 1
 
     print("\nsections:")
     for name, vaddr, vsize, _raw, rawsize in info["sections"]:

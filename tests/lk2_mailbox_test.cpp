@@ -68,6 +68,17 @@ static void test_post_truncates_oversized_text() {
     CHECK(msg.len == kMaxText - 1); CHECK(msg.text[msg.len] == '\0');
 }
 
+static void test_post_reports_truncation_to_the_caller() {
+    Mailbox m;
+    std::string big(kMaxText + 500, 'z');
+    bool cut = false;
+    CHECK(m.Post(big.c_str(), static_cast<uint32_t>(big.size()), &cut) == 1);
+    CHECK(cut);
+    cut = true;
+    CHECK(m.Post("small", 5, &cut) == 2);
+    CHECK(!cut);
+}
+
 static void test_reply_poll_by_exact_id_is_non_destructive() {
     Mailbox m;
     Post(m, "q");
@@ -164,6 +175,7 @@ int main() {
     test_take_outbound_is_fifo();
     test_post_returns_zero_when_outbound_is_full_and_recovers();
     test_post_truncates_oversized_text();
+    test_post_reports_truncation_to_the_caller();
     test_reply_poll_by_exact_id_is_non_destructive();
     test_poll_latest_follows_the_last_post();
     test_control_messages_are_consumed_fifo();

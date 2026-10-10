@@ -44,8 +44,9 @@ class Mailbox {
 
     // Game thread. Queues `text` and returns its id (>= 1), or 0 if the outbound
     // queue is full -- nothing is queued and no id is consumed. Text longer
-    // than kMaxText-1 is cut. Evicts every stored reply with an older id.
-    int Post(const char* text, uint32_t len);
+    // than kMaxText-1 is cut and `*truncated` (optional) says so, so the caller
+    // can log it. Evicts every stored reply with an older id.
+    int Post(const char* text, uint32_t len, bool* truncated = nullptr);
 
     // Worker. Oldest queued request, or false when there is none.
     bool TakeOutbound(Message* out);

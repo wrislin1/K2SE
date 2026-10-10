@@ -88,6 +88,14 @@ static void test_decode_rejects_bad_input() {
     CHECK(Decode("{\"id\":-1,\"text\":\"neg ok\"}").id == -1);
 }
 
+static void test_decode_rejects_ids_beyond_int32() {
+    CHECK(Decode("{\"id\":2147483647,\"text\":\"max\"}").id == 2147483647);
+    CHECK(!Decode("{\"id\":2147483648,\"text\":\"x\"}").ok);
+    // Eleven digits overflow a 32-bit accumulator before the bound check can run.
+    CHECK(!Decode("{\"id\":21474836470,\"text\":\"x\"}").ok);
+    CHECK(!Decode("{\"id\":99999999999999999999,\"text\":\"x\"}").ok);
+}
+
 static void test_roundtrip() {
     const char* src = "Kreia says: \"Apathy is death.\"\n\t\\ end";
     std::string line = Enc(42, src);
@@ -105,6 +113,7 @@ int main() {
     test_decode_non_latin_unicode_becomes_question_mark();
     test_decode_truncates_long_text();
     test_decode_rejects_bad_input();
+    test_decode_rejects_ids_beyond_int32();
     test_roundtrip();
     std::printf("lk2_proto_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

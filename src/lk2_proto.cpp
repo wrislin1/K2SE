@@ -166,10 +166,12 @@ bool ParseInt(Cursor& c, int* out) {
     bool neg = false;
     if (c.take('-')) neg = true;
     if (c.peek() < '0' || c.peek() > '9') return false;
-    long v = 0;
+    // 64-bit on purpose: `long` is 32 bits under MSVC, where the tenth digit
+    // overflowed before the bound below could reject it.
+    int64_t v = 0;
     while (c.peek() >= '0' && c.peek() <= '9') {
         v = v * 10 + (*c.p - '0');
-        if (v > 2147483647L) return false;
+        if (v > 2147483647LL) return false;
         ++c.p;
     }
     *out = static_cast<int>(neg ? -v : v);

@@ -3,7 +3,7 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -Werror -O1 -I../src
 OUT := ../out/tests
-TESTS := $(OUT)/lk2_proto_test $(OUT)/lk2_mailbox_test
+TESTS := $(OUT)/lk2_proto_test $(OUT)/lk2_mailbox_test $(OUT)/lk2_meter_test
 
 all: $(TESTS)
 	@set -e; for t in $(TESTS); do $$t; done
@@ -11,6 +11,8 @@ all: $(TESTS)
 proto: $(OUT)/lk2_proto_test
 	$<
 mailbox: $(OUT)/lk2_mailbox_test
+	$<
+meter: $(OUT)/lk2_meter_test
 	$<
 
 $(OUT)/lk2_proto_test: lk2_proto_test.cpp ../src/lk2_proto.cpp ../src/lk2_proto.h
@@ -21,6 +23,10 @@ $(OUT)/lk2_mailbox_test: lk2_mailbox_test.cpp ../src/lk2_mailbox.cpp ../src/lk2_
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) lk2_mailbox_test.cpp ../src/lk2_mailbox.cpp -o $@
 
+$(OUT)/lk2_meter_test: lk2_meter_test.cpp ../src/lk2_meter.cpp ../src/lk2_meter.h
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) lk2_meter_test.cpp ../src/lk2_meter.cpp -o $@
+
 clean:
 	rm -rf $(OUT)
-.PHONY: all proto mailbox clean
+.PHONY: all proto mailbox meter clean

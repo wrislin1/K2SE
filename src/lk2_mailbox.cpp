@@ -19,7 +19,8 @@ void Mailbox::Fill(Message* m, int id, const char* text, uint32_t len, bool* tru
     if (truncated) *truncated = cut;
 }
 
-int Mailbox::Post(const char* text, uint32_t len) {
+int Mailbox::Post(const char* text, uint32_t len, bool* truncated) {
+    if (truncated) *truncated = false;
     if (outCount_ >= kOutboundSlots) return 0;
     const int id = nextId_++;
     lastId_ = id;
@@ -27,7 +28,7 @@ int Mailbox::Post(const char* text, uint32_t len) {
     for (Slot& s : in_)
         if (s.used && s.msg.id > 0 && s.msg.id < id) s.used = false;
     Message& m = out_[(outHead_ + outCount_) % kOutboundSlots];
-    Fill(&m, id, text, len, nullptr);
+    Fill(&m, id, text, len, truncated);
     ++outCount_;
     return id;
 }
