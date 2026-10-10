@@ -12,6 +12,8 @@
 #include "fov.h"
 #include "camera.h"
 #include "spawner.h"
+#include "bridge.h"
+#include "lk2_mailbox.h"
 #include "npcvariety.h"
 #include "offsets.h"
 #include "vm.h"
@@ -44,7 +46,7 @@ uint32_t g_reportPassMask = 0;  // ... and its last REPORTED answer was a pass
 
 // Per-routine dispatch counts, indexed by position in kExtended (not by routine
 // id). Only the trace thinning reads them; nothing may make a decision from one.
-uint32_t g_dispatchCount[32] = {0};
+uint32_t g_dispatchCount[64] = {0};
 
 // --- on-screen banner --------------------------------------------------------
 // void __cdecl AurPostString(const char* text, int x, int y, float fLife)
@@ -587,6 +589,37 @@ int H_GetVarietyStatus(int /*nParams*/) {
     return 0;
 }
 
+// --- living-kotor2 bridge: 909..910 ---------------------------------------------
+// The string ABI these ride on is the one EchoString proved on 2026-10-09; the
+// socket and the queues live in bridge.cpp and never touch the VM stack.
+
+// 909: int LK2_Post(string sText)
+int H_LK2Post(int /*nParams*/) {
+#if K2SE_ENABLE_STACK_ABI
+    ExoString value;
+    if (!value.valid()) return off::kErrParam;
+    if (!PopString(&value)) return off::kErrParam;
+    const int id = bridge::Post(value.c_str(), value.length());
+    if (!PushInt(id)) return off::kErrPushFailed;
+#endif
+    return 0;
+}
+
+// 910: string LK2_Poll(int nId)
+int H_LK2Poll(int /*nParams*/) {
+#if K2SE_ENABLE_STACK_ABI
+    int nId = 0;
+    if (!PopInt(&nId)) return off::kErrParam;
+    static char buf[lk2::kMaxText];  // game thread only
+    uint32_t len = 0;
+    if (!bridge::Poll(nId, buf, sizeof(buf), &len)) buf[0] = '\0';
+    ExoString out(buf);
+    if (!out.valid()) return off::kErrParam;
+    if (!PushString(&out)) return off::kErrPushFailed;
+#endif
+    return 0;
+}
+
 struct Extended {
     int id;
     const char* name;
@@ -630,6 +663,9 @@ constexpr Extended kExtended[] = {
     {906, "K2SE_SpawnFacing", 1, &H_SpawnFacing},
     {907, "K2SE_SpawnReport", 2, &H_SpawnReport},
     {908, "K2SE_GetVarietyStatus", 0, &H_GetVarietyStatus},
+    // living-kotor2 bridge -- ids allocated from 909 upward
+    {909, "LK2_Post", 1, &H_LK2Post},
+    {910, "LK2_Poll", 1, &H_LK2Poll},
 };
 constexpr int kExtendedCount = static_cast<int>(sizeof(kExtended) / sizeof(kExtended[0]));
 

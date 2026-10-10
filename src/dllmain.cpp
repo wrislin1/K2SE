@@ -16,6 +16,7 @@
 #include "offsets.h"
 #include "routines.h"
 #include "vm.h"
+#include "bridge.h"
 
 // The proxy stubs resolve the real version.dll lazily, on first call -- not
 // here. LoadLibrary from DllMain runs under the loader lock and is exactly the
@@ -77,6 +78,7 @@ void OnAttach(HMODULE self) {
 }
 
 void OnDetach() {
+    k2se::bridge::Remove();
     k2se::console::Remove();
     k2se::npcvariety::Remove();
     k2se::spawner::Remove();

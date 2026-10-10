@@ -6393,3 +6393,17 @@ float K2SE_SpawnFacing(int nIndex);
 int K2SE_SpawnReport(int nIndex, int bCreated);
 // 908:
 int K2SE_GetVarietyStatus();
+
+// ============================================================
+// living-kotor2 bridge routines (LK2_). Appended after K2SE's
+// last entry; never insert above this line.
+// ============================================================
+// 909: hands sText to the external responder over the bridge
+// socket. Returns the request id (>= 1), or 0 if the bridge
+// could not queue it. Never blocks.
+int LK2_Post(string sText);
+// 910: the responder's reply to request nId, or "" if none has
+// arrived. nId = -1 polls the most recent LK2_Post; nId = 0 reads
+// the responder's control channel (one message, consumed).
+// Never blocks.
+string LK2_Poll(int nId);

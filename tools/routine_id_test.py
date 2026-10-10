@@ -187,6 +187,18 @@ def main():
         raw = "05 00 %02X %02X %02X" % (rid >> 8, rid & 0xFF, argc)
         print("OK    %-20s id %-4d argc %d   ACTION %s" % (name, rid, argc, raw))
 
+    # The other direction: every prototype appended past the vanilla table must
+    # have a routines.cpp row, or the compiler happily emits an ACTION the DLL
+    # answers with -2002 and the script dies silently in game.
+    FIRST_EXTENDED = 877
+    in_table = {name for _id, name, _argc in table}
+    for pos, (name, _rt, _args) in enumerate(protos):
+        if pos < FIRST_EXTENDED or name in in_table:
+            continue
+        print("FAIL  %-20s declared at header position %d but has no routines.cpp row"
+              % (name, pos))
+        failures += 1
+
     print("")
     if failures:
         print("%d routine(s) FAILED -- routines.cpp, nwscript_k2se.nss and the "
