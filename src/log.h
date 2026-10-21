@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "lk2_meter.h"
 
 // Raw Win32 logging. Deliberately no CRT file I/O:
 // on process exit Windows terminates every other thread BEFORE calling
@@ -25,6 +26,11 @@ void Shutdown();
 
 void Write(const char* line);
 void Writef(const char* fmt, ...);
+
+// Same bytes and synchronous write as Writef/Trace. Only this caller's sink
+// receives the raw WriteFile boundaries/outcome; unrelated logging has no sink.
+void WritefMeasured(lk2::WriteSample& sample, const char* fmt, ...);
+void TraceMeasured(lk2::WriteSample& sample, const char* fmt, ...);
 
 // Milliseconds since Init(), i.e. since the DLL loaded. Only the session header
 // carries a clock, so "this failed at t+21s and worked at t+29s" -- a different

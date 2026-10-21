@@ -97,6 +97,19 @@ target_link_options(k2se PRIVATE
 
 target_link_libraries(k2se PRIVATE kernel32)
 
+# Explicit native integration target; never linked into the proxy DLL.
+add_executable(lk2_log_native_test EXCLUDE_FROM_ALL
+    tests/lk2_log_native_test.cpp src/lk2_meter.cpp src/lk2_proto.cpp src/lk2_mailbox.cpp)
+set_property(TARGET lk2_log_native_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+set_property(TARGET lk2_log_native_test PROPERTY CXX_STANDARD 17)
+target_compile_definitions(lk2_log_native_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
+    K2SE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    K2SE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    K2SE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
+target_compile_options(lk2_log_native_test PRIVATE /W4 /permissive- /EHsc)
+target_link_libraries(lk2_log_native_test PRIVATE kernel32)
+
 # --- post-build sanity ------------------------------------------------------
 add_custom_command(TARGET k2se POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "K2SE built: $<TARGET_FILE:k2se>"

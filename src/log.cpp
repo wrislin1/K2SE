@@ -28,10 +28,43 @@ void ResolveDllDir() {
     if (slash) *(slash + 1) = L'\0';
 }
 
-void RawWrite(const char* text, size_t len) {
-    if (g_file == INVALID_HANDLE_VALUE) return;
+uint64_t LogNow() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart);
+}
+
+void RawWrite(const char* text, size_t len, lk2::WriteSample* sample = nullptr) {
+    if (sample) sample->requested = static_cast<uint32_t>(len);
+    if (g_file == INVALID_HANDLE_VALUE) {
+        if (sample) sample->state = lk2::WriteState::Skipped;
+        return;
+    }
     DWORD written = 0;
-    WriteFile(g_file, text, static_cast<DWORD>(len), &written, nullptr);
+    if (!sample) {
+        WriteFile(g_file, text, static_cast<DWORD>(len), &written, nullptr);
+        return;
+    }
+    sample->span.begin = LogNow();
+    const BOOL ok = WriteFile(g_file, text, static_cast<DWORD>(len), &written, nullptr);
+    // Preserve the failure before the next clock/helper can change last-error.
+    const DWORD error = ok ? 0 : GetLastError();
+    sample->span.end = LogNow();
+    sample->state = ok ? lk2::WriteState::Ok : lk2::WriteState::Failed;
+    sample->written = written;
+    sample->error = error;
+}
+
+void VWritef(lk2::WriteSample* sample, bool trace, const char* fmt, va_list args) {
+    if (sample) *sample = lk2::WriteSample{};
+    if (trace && !g_diagnostic) return;
+    char body[1024];
+    _vsnprintf(body, sizeof(body), fmt, args);
+    body[sizeof(body) - 1] = '\0';
+    char buf[1200];
+    int len = _snprintf(buf, sizeof(buf), trace ? "  [trace] %s\r\n" : "%s\r\n", body);
+    if (len < 0) len = static_cast<int>(sizeof(buf)) - 1;
+    RawWrite(buf, static_cast<size_t>(len), sample);
 }
 
 }  // namespace
@@ -94,27 +127,31 @@ void Write(const char* line) {
 }
 
 void Writef(const char* fmt, ...) {
-    char body[1024];
     va_list args;
     va_start(args, fmt);
-    _vsnprintf(body, sizeof(body), fmt, args);
+    VWritef(nullptr, false, fmt, args);
     va_end(args);
-    body[sizeof(body) - 1] = '\0';
-    Write(body);
 }
 
 void Trace(const char* fmt, ...) {
-    if (!g_diagnostic) return;
-    char body[1024];
     va_list args;
     va_start(args, fmt);
-    _vsnprintf(body, sizeof(body), fmt, args);
+    VWritef(nullptr, true, fmt, args);
     va_end(args);
-    body[sizeof(body) - 1] = '\0';
-    char buf[1200];
-    int len = _snprintf(buf, sizeof(buf), "  [trace] %s\r\n", body);
-    if (len < 0) len = static_cast<int>(sizeof(buf)) - 1;
-    RawWrite(buf, static_cast<size_t>(len));
+}
+
+void WritefMeasured(lk2::WriteSample& sample, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    VWritef(&sample, false, fmt, args);
+    va_end(args);
+}
+
+void TraceMeasured(lk2::WriteSample& sample, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    VWritef(&sample, true, fmt, args);
+    va_end(args);
 }
 
 }  // namespace log

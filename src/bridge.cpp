@@ -64,6 +64,7 @@ struct State {
     // and the log call alone (only polls that made one).
     lk2::MaxTimer pollLockTimer;
     lk2::MaxTimer pollLogTimer;
+    lk2::PollSample worstPoll;
     lk2::PollTraceThinner thinner;
 };
 
@@ -100,6 +101,21 @@ uint64_t Now() {
     return static_cast<uint64_t>(c.QuadPart);
 }
 
+// Poll-only sink; existing worker and other bridge logs remain unmeasured.
+void BPollLog(lk2::WriteSample& sample, bool trace, const char* fmt, ...) {
+    if (trace && !log::DiagnosticEnabled()) return;
+    char body[900];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf(body, sizeof(body), fmt, args);
+    va_end(args);
+    body[sizeof(body) - 1] = '\0';
+    if (trace)
+        log::TraceMeasured(sample, "bridge: t=%u %s", log::MillisSinceInit(), body);
+    else
+        log::WritefMeasured(sample, "bridge: t=%u %s", log::MillisSinceInit(), body);
+}
+
 // Records the time from construction to scope exit into a MaxTimer, tagged
 // with the log's t= at entry: one of these at the top of Post/Poll covers every
 // return path, log write included.
@@ -107,8 +123,29 @@ struct ScopedMax {
     lk2::MaxTimer& timer;
     uint32_t at;
     uint64_t t0;
-    explicit ScopedMax(lk2::MaxTimer& t) : timer(t), at(log::MillisSinceInit()), t0(Now()) {}
-    ~ScopedMax() { timer.Record(t0, Now(), at); }
+    lk2::TickSpan* span;
+    explicit ScopedMax(lk2::MaxTimer& t, lk2::TickSpan* s = nullptr)
+        : timer(t), at(log::MillisSinceInit()), t0(Now()), span(s) {}
+    ~ScopedMax() {
+        const uint64_t end = Now();
+        if (span) *span = {t0, end};
+        timer.Record(t0, end, at);
+    }
+};
+
+// Same full-Poll boundaries as ScopedMax, with sample initialization after the
+// start tick. The single end tick chooses BOTH the legacy maximum and its pair.
+struct ScopedPoll {
+    uint32_t at;
+    uint64_t t0;
+    lk2::PollSample sample;
+    ScopedPoll() : at(log::MillisSinceInit()), t0(Now()) {}
+    ~ScopedPoll() {
+        const uint64_t end = Now();
+        sample.full = {t0, end};
+        sample.at = at;
+        lk2::RecordPoll(g_st.pollTimer, g_st.worstPoll, sample);
+    }
 };
 
 int WsaError() { return g_st.ws.lastError ? g_st.ws.lastError() : -1; }
@@ -382,30 +419,37 @@ int Post(const char* text, uint32_t len) {
 bool Poll(int id, char* out, uint32_t cap, uint32_t* len) {
     EnsureStarted();
     if (!g_st.lockReady) return false;
-    ScopedMax meter(g_st.pollTimer);
+    ScopedPoll meter;
+    meter.sample.id = id;
     bool ok;
     int latest;
     {
-        ScopedMax lockMeter(g_st.pollLockTimer);
+        ScopedMax lockMeter(g_st.pollLockTimer, &meter.sample.locked);
         EnterCriticalSection(&g_st.lock);
         ok = g_box.Poll(id, out, cap, len);
         latest = g_box.LastPostedId();
         LeaveCriticalSection(&g_st.lock);
     }
+    meter.sample.latest = latest;
+    meter.sample.found = ok;
     if (ok) {
-        ScopedMax logMeter(g_st.pollLogTimer);
-        BLog("poll id=%d (latest %d) -> len=%u \"%.80s\"", id, latest, *len, out);
+        meter.sample.logCalled = true;
+        ScopedMax logMeter(g_st.pollLogTimer, &meter.sample.log);
+        BPollLog(meter.sample.write, false,
+                 "poll id=%d (latest %d) -> len=%u \"%.80s\"", id, latest, *len, out);
     } else {
         // One trace per (id, latest) state; run 1 wrote 100 identical lines
         // between "End." and quit.
         uint32_t swallowed = 0;
         if (g_st.thinner.Note(id, latest, &swallowed)) {
-            ScopedMax logMeter(g_st.pollLogTimer);
+            meter.sample.logCalled = true;
+            ScopedMax logMeter(g_st.pollLogTimer, &meter.sample.log);
             if (swallowed)
-                BTrace("poll id=%d (latest %d) -> nothing [%u earlier identical polls untraced]",
+                BPollLog(meter.sample.write, true,
+                       "poll id=%d (latest %d) -> nothing [%u earlier identical polls untraced]",
                        id, latest, swallowed);
             else
-                BTrace("poll id=%d (latest %d) -> nothing", id, latest);
+                BPollLog(meter.sample.write, true, "poll id=%d (latest %d) -> nothing", id, latest);
         }
     }
     return ok;
@@ -447,6 +491,14 @@ void Remove() {
          lk2::TicksToMicros(g_st.pollLockTimer.maxTicks, g_st.qpcFreq), g_st.pollLockTimer.maxAt,
          lk2::TicksToMicros(g_st.pollLogTimer.maxTicks, g_st.qpcFreq), g_st.pollLogTimer.maxAt,
          g_st.pollLogTimer.count);
+    const lk2::PollSample& p = g_st.worstPoll;
+    BLog("game-thread paired: ordinal=%u t=%u id=%d latest=%d found=%u log-call=%u qpc-frequency=%llu "
+         "full=%llu..%llu locked=%llu..%llu log=%llu..%llu",
+         p.ordinal, p.at, p.id, p.latest, p.found ? 1u : 0u, p.logCalled ? 1u : 0u, g_st.qpcFreq,
+         p.full.begin, p.full.end, p.locked.begin, p.locked.end, p.log.begin, p.log.end);
+    BLog("game-thread paired write: state=%u requested=%u written=%u error=%u span=%llu..%llu",
+         static_cast<uint32_t>(p.write.state), p.write.requested, p.write.written, p.write.error,
+         p.write.span.begin, p.write.span.end);
     const uint32_t untraced = g_st.thinner.Flush();
     if (untraced) BTrace("%u trailing identical empty polls untraced", untraced);
     g_st.started = false;

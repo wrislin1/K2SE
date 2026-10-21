@@ -48,6 +48,39 @@ struct MaxTimer {
 // frequency.
 uint32_t TicksToMicros(uint64_t ticks, uint64_t freq);
 
+// Raw QPC boundaries, deliberately not independently maximized or rounded.
+struct TickSpan {
+    uint64_t begin = 0, end = 0;
+};
+
+enum class WriteState : uint32_t { None, Skipped, Ok, Failed };
+
+// Caller-owned: worker logging cannot overwrite a game-thread observation.
+struct WriteSample {
+    TickSpan span;
+    WriteState state = WriteState::None;
+    uint32_t requested = 0, written = 0, error = 0;
+};
+
+struct PollSample {
+    TickSpan full, locked, log;
+    WriteSample write;
+    uint32_t at = 0, ordinal = 0;
+    int id = 0, latest = 0;
+    bool found = false, logCalled = false;
+};
+
+// Choose the pair with exactly the same endpoint and strict first-wins rule
+// as the legacy full timer. A zero/backwards interval cannot set its maximum.
+inline void RecordPoll(MaxTimer& timer, PollSample& worst, const PollSample& call) {
+    if (call.full.end < call.full.begin) return;
+    if (call.full.end - call.full.begin > timer.maxTicks) {
+        worst = call;
+        worst.ordinal = timer.count + 1;
+    }
+    timer.Record(call.full.begin, call.full.end, call.at);
+}
+
 class PollTraceThinner {
   public:
     PollTraceThinner() : haveLast_(false), lastId_(0), lastLatest_(0), suppressed_(0) {}
