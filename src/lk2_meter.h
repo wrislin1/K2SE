@@ -24,13 +24,21 @@ namespace lk2 {
 struct MaxTimer {
     uint64_t maxTicks = 0;
     uint32_t count = 0;
+    uint32_t maxAt = 0;       // caller's tag for the first interval that set the maximum
+    uint64_t overTicks = 0;   // threshold for `over`; 0 counts nothing
+    uint32_t over = 0;        // intervals strictly longer than overTicks
 
     // Records one interval; an end before its start is a counter glitch and is
-    // neither counted nor allowed to poison the maximum.
-    void Record(uint64_t start, uint64_t end) {
+    // neither counted nor allowed to poison the maximum. `at` says when it
+    // happened (the DLL passes the log's t= milliseconds).
+    void Record(uint64_t start, uint64_t end, uint32_t at = 0) {
         if (end < start) return;
         const uint64_t d = end - start;
-        if (d > maxTicks) maxTicks = d;
+        if (d > maxTicks) {
+            maxTicks = d;
+            maxAt = at;
+        }
+        if (overTicks && d > overTicks) ++over;
         ++count;
     }
 };

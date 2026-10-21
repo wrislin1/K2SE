@@ -59,6 +59,11 @@ struct State {
     uint64_t qpcFreq = 0;
     lk2::MaxTimer postTimer;
     lk2::MaxTimer pollTimer;
+    // Stage 4 run 8 printed poll=2684 us and could not say why: pollTimer spans
+    // the diagnostic log write too. These split it: the locked mailbox section,
+    // and the log call alone (only polls that made one).
+    lk2::MaxTimer pollLockTimer;
+    lk2::MaxTimer pollLogTimer;
     lk2::PollTraceThinner thinner;
 };
 
@@ -95,13 +100,15 @@ uint64_t Now() {
     return static_cast<uint64_t>(c.QuadPart);
 }
 
-// Records the time from construction to scope exit into a MaxTimer: one of
-// these at the top of Post/Poll covers every return path, log write included.
+// Records the time from construction to scope exit into a MaxTimer, tagged
+// with the log's t= at entry: one of these at the top of Post/Poll covers every
+// return path, log write included.
 struct ScopedMax {
     lk2::MaxTimer& timer;
+    uint32_t at;
     uint64_t t0;
-    explicit ScopedMax(lk2::MaxTimer& t) : timer(t), t0(Now()) {}
-    ~ScopedMax() { timer.Record(t0, Now()); }
+    explicit ScopedMax(lk2::MaxTimer& t) : timer(t), at(log::MillisSinceInit()), t0(Now()) {}
+    ~ScopedMax() { timer.Record(t0, Now(), at); }
 };
 
 int WsaError() { return g_st.ws.lastError ? g_st.ws.lastError() : -1; }
@@ -329,6 +336,9 @@ void EnsureStarted() {
     const uint64_t t0 = Now();
     LARGE_INTEGER f;
     g_st.qpcFreq = QueryPerformanceFrequency(&f) ? static_cast<uint64_t>(f.QuadPart) : 0;
+    // The checker's E4 bound: count calls over 1000 us, not just the worst one.
+    g_st.postTimer.overTicks = g_st.qpcFreq / 1000;
+    g_st.pollTimer.overTicks = g_st.qpcFreq / 1000;
     InitializeCriticalSection(&g_st.lock);
     g_st.lockReady = true;
     g_st.stop = 0;
@@ -373,17 +383,24 @@ bool Poll(int id, char* out, uint32_t cap, uint32_t* len) {
     EnsureStarted();
     if (!g_st.lockReady) return false;
     ScopedMax meter(g_st.pollTimer);
-    EnterCriticalSection(&g_st.lock);
-    const bool ok = g_box.Poll(id, out, cap, len);
-    const int latest = g_box.LastPostedId();
-    LeaveCriticalSection(&g_st.lock);
+    bool ok;
+    int latest;
+    {
+        ScopedMax lockMeter(g_st.pollLockTimer);
+        EnterCriticalSection(&g_st.lock);
+        ok = g_box.Poll(id, out, cap, len);
+        latest = g_box.LastPostedId();
+        LeaveCriticalSection(&g_st.lock);
+    }
     if (ok) {
+        ScopedMax logMeter(g_st.pollLogTimer);
         BLog("poll id=%d (latest %d) -> len=%u \"%.80s\"", id, latest, *len, out);
     } else {
         // One trace per (id, latest) state; run 1 wrote 100 identical lines
         // between "End." and quit.
         uint32_t swallowed = 0;
         if (g_st.thinner.Note(id, latest, &swallowed)) {
+            ScopedMax logMeter(g_st.pollLogTimer);
             if (swallowed)
                 BTrace("poll id=%d (latest %d) -> nothing [%u earlier identical polls untraced]",
                        id, latest, swallowed);
@@ -420,6 +437,16 @@ void Remove() {
          lk2::TicksToMicros(g_st.postTimer.maxTicks, g_st.qpcFreq),
          lk2::TicksToMicros(g_st.pollTimer.maxTicks, g_st.qpcFreq), g_st.postTimer.count,
          g_st.pollTimer.count);
+    // Where that time went: when each maximum happened (t= of the call), how
+    // many calls broke 1000 us, and the poll split into its locked mailbox
+    // section and its log call (a delivered reply always writes a line; an
+    // empty-poll trace writes only under K2SE_DIAGNOSTIC).
+    BLog("game-thread detail: post max at t=%u, %u over 1000 us; poll max at t=%u, %u over 1000 us; "
+         "poll locked max=%u us at t=%u; poll log call max=%u us at t=%u over %u calls",
+         g_st.postTimer.maxAt, g_st.postTimer.over, g_st.pollTimer.maxAt, g_st.pollTimer.over,
+         lk2::TicksToMicros(g_st.pollLockTimer.maxTicks, g_st.qpcFreq), g_st.pollLockTimer.maxAt,
+         lk2::TicksToMicros(g_st.pollLogTimer.maxTicks, g_st.qpcFreq), g_st.pollLogTimer.maxAt,
+         g_st.pollLogTimer.count);
     const uint32_t untraced = g_st.thinner.Flush();
     if (untraced) BTrace("%u trailing identical empty polls untraced", untraced);
     g_st.started = false;

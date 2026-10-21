@@ -33,6 +33,35 @@ static void test_max_timer_ignores_a_backwards_interval() {
     CHECK(t.maxTicks == 0); CHECK(t.count == 0);
 }
 
+static void test_max_timer_remembers_when_its_maximum_happened() {
+    MaxTimer t;
+    CHECK(t.maxAt == 0);
+    t.Record(100, 350, 7);
+    CHECK(t.maxAt == 7);
+    t.Record(1000, 1010, 9);        // smaller: the time of the maximum stays
+    CHECK(t.maxAt == 7);
+    t.Record(5000, 5900, 12);
+    CHECK(t.maxAt == 12);
+    t.Record(6000, 6900, 15);       // equal: the first occurrence stays
+    CHECK(t.maxAt == 12);
+}
+
+static void test_max_timer_counts_intervals_over_its_threshold() {
+    MaxTimer t;
+    t.Record(0, 5000, 1);           // no threshold set: nothing is counted over
+    CHECK(t.over == 0);
+    t.overTicks = 100;
+    t.Record(0, 100, 2);            // at the threshold is not over it
+    CHECK(t.over == 0);
+    t.Record(0, 101, 3);
+    CHECK(t.over == 1);
+    t.Record(0, 50, 4);
+    CHECK(t.over == 1);
+    t.Record(300, 200, 5);          // backwards: not counted over either
+    CHECK(t.over == 1);
+    CHECK(t.count == 4);
+}
+
 static void test_ticks_to_micros_rounds_to_nearest() {
     CHECK(TicksToMicros(250, 1000000) == 250);
     CHECK(TicksToMicros(10, 10000000) == 1);
@@ -73,6 +102,8 @@ static void test_thinner_flush_reports_and_clears_the_pending_count() {
 int main() {
     test_max_timer_keeps_the_largest_interval_and_counts_calls();
     test_max_timer_ignores_a_backwards_interval();
+    test_max_timer_remembers_when_its_maximum_happened();
+    test_max_timer_counts_intervals_over_its_threshold();
     test_ticks_to_micros_rounds_to_nearest();
     test_ticks_to_micros_saturates_at_uint32_max();
     test_thinner_writes_the_first_report_of_each_state();
